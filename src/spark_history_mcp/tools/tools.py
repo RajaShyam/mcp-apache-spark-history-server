@@ -72,6 +72,48 @@ def get_application(app_id: str, server: Optional[str] = None) -> ApplicationInf
 
 
 @mcp.tool()
+def list_applications(
+    server: Optional[str] = None,
+    status: Optional[list[str]] = None,
+    min_date: Optional[str] = None,
+    max_date: Optional[str] = None,
+    min_end_date: Optional[str] = None,
+    max_end_date: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> list:
+    """
+    Get a list of all Spark applications from the history server.
+
+    Retrieves a list of Spark applications with optional filtering by status,
+    date ranges, and result limits. Useful for discovering available applications
+    for further analysis.
+
+    Args:
+        server: Optional server name to use (uses default if not specified)
+        status: Optional list of application status values to filter by (e.g., ['COMPLETED', 'RUNNING'])
+        min_date: Minimum start date filter (format: yyyy-MM-dd'T'HH:mm:ss.SSSz or yyyy-MM-dd)
+        max_date: Maximum start date filter
+        min_end_date: Minimum end date filter
+        max_end_date: Maximum end date filter  
+        limit: Maximum number of applications to return
+
+    Returns:
+        List of ApplicationInfo objects containing application details
+    """
+    ctx = mcp.get_context()
+    client = get_client_or_default(ctx, server)
+
+    return client.list_applications(
+        status=status,
+        min_date=min_date,
+        max_date=max_date,
+        min_end_date=min_end_date,
+        max_end_date=max_end_date,
+        limit=limit,
+    )
+
+
+@mcp.tool()
 def list_jobs(
     app_id: str, server: Optional[str] = None, status: Optional[list[str]] = None
 ) -> list:
