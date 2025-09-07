@@ -1,0 +1,87 @@
+# Example Configurations for MCP Apache Spark History Server
+
+# Example 1: Local Spark History Server (default)
+local_example:
+  servers:
+    local:
+      default: true
+      url: "http://localhost:18080"
+
+# Example 2: Remote Spark History Server with Basic Auth
+remote_with_auth_example:
+  servers:
+    production:
+      default: true
+      url: "https://spark-history.company.com:18080"
+      auth:
+        username: "user"
+        password: "pass"
+      verify_ssl: true
+
+# Example 3: EMR Terminated Cluster with S3 Access (AWS Default Credentials)
+emr_default_credentials_example:
+  servers:
+    emr-terminated:
+      default: true
+      url: "http://10.176.3.183:18080"
+      emr_cluster_arn: "arn:aws:elasticmapreduce:us-east-1:123456789012:cluster/j-ABCDEFGHIJKLM"
+      s3_log_bucket: "my-emr-logs-bucket"
+      s3_log_path_pattern: "logs/emr_clusters/prod/{cluster_id}/containers/"
+      # aws_profile: not specified - uses default AWS credentials
+      verify_ssl: false
+
+# Example 4: EMR Terminated Cluster with Custom AWS Profile (Current Setup)
+emr_custom_profile_example:
+  servers:
+    emr-terminated:
+      default: true
+      url: "http://10.176.3.183:18080"
+      emr_cluster_arn: "arn:aws:elasticmapreduce:us-east-1:308852840113:cluster/j-2SSLI5LHOWQZ0"
+      s3_log_bucket: "grubhub-dl-s3-logging"
+      s3_log_path_pattern: "logs/emr_clusters/prod/{cluster_id}/containers/"
+      # Custom AWS profile for cross-account or role-based access
+      aws_profile: "GDPProdDataInfrastructureSRE-308852840113"
+      verify_ssl: false
+
+# Example 5: Multiple Environments
+multiple_environments_example:
+  servers:
+    dev:
+      url: "http://dev-spark-history:18080"
+      emr_cluster_arn: "arn:aws:elasticmapreduce:us-east-1:123456789012:cluster/j-DEV12345"
+      s3_log_bucket: "dev-logs-bucket"
+      aws_profile: "dev-profile"
+      
+    prod:
+      default: true  # This will be the default server
+      url: "http://prod-spark-history:18080"
+      emr_cluster_arn: "arn:aws:elasticmapreduce:us-east-1:123456789012:cluster/j-PROD12345"
+      s3_log_bucket: "prod-logs-bucket"
+      aws_profile: "prod-profile"
+      verify_ssl: true
+
+# MCP Configuration (same for all examples)
+mcp:
+  transports:
+    - streamable-http  # For web interfaces (MCP Inspector, etc.)
+    - stdio            # For CLI tools (Amazon Q CLI, etc.)
+  port: "18888"        # Port for streamable-http transport
+  debug: true          # Enable debug logging
+
+# AWS Profile Configuration Notes:
+# 
+# 1. Default AWS Credentials (aws_profile: not specified):
+#    - Uses default AWS credential chain: ~/.aws/credentials, IAM roles, env vars
+#    - Good for: Single AWS account, EC2 instances with IAM roles
+#
+# 2. Named AWS Profile (aws_profile: "profile-name"):
+#    - Uses specific profile from ~/.aws/credentials or ~/.aws/config
+#    - Good for: Multiple AWS accounts, cross-account access, specific roles
+#    - Profile must exist in your AWS configuration
+#
+# 3. Profile Setup Example in ~/.aws/config:
+#    [profile GDPProdDataInfrastructureSRE-308852840113]
+#    role_arn = arn:aws:iam::308852840113:role/DataInfrastructureSRE
+#    source_profile = default
+#    region = us-east-1
+

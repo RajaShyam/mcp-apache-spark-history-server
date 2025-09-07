@@ -8,12 +8,14 @@ and establish an HTTP session with proper cookie management for Spark History Se
 
 import logging
 import time
+import warnings
 from typing import Dict, Optional, Tuple
 from urllib.parse import urlparse
 
 import boto3
 import requests
 from botocore.exceptions import ClientError
+from urllib3.exceptions import InsecureRequestWarning
 
 from spark_history_mcp.config.config import ServerConfig
 
@@ -48,6 +50,15 @@ class EMRPersistentUIClient:
         self.presigned_url: Optional[str] = None
         self.base_url: Optional[str] = None
         self.timeout: int = server_config.timeout
+        self.verify_ssl: bool = server_config.verify_ssl
+        
+        # Log SSL verification status
+        if self.verify_ssl:
+            logger.debug("✅ SSL certificate verification enabled")
+        else:
+            logger.warning("⚠️  SSL certificate verification DISABLED - this is not recommended for production")
+            # Suppress urllib3 warnings when SSL verification is explicitly disabled
+            warnings.filterwarnings('ignore', message='Unverified HTTPS request', category=InsecureRequestWarning)
 
     def create_persistent_app_ui(self) -> Dict:
         """
@@ -203,9 +214,13 @@ class EMRPersistentUIClient:
 
         try:
             # Make initial request to establish session and get cookies
-            logger.info("Making initial request")
+            logger.info("Making initial HTTPS request with SSL verification")
+            logger.debug(f"SSL verification: {'enabled' if self.verify_ssl else 'DISABLED'}")
             response = self.session.get(
-                self.presigned_url, timeout=self.timeout, allow_redirects=True
+                self.presigned_url, 
+                timeout=self.timeout, 
+                allow_redirects=True,
+                verify=self.verify_ssl  # Use configured SSL verification setting
             )
             response.raise_for_status()
 

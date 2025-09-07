@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "spark-history": {
+      "transport": {
+        "type": "sse",
+        "url": "http://localhost:18888"
+      }
+    }
+  }
+}

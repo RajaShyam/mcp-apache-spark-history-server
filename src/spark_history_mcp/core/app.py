@@ -67,7 +67,10 @@ def run(config: Config):
     mcp.settings.host = config.mcp.address
     mcp.settings.port = int(config.mcp.port)
     mcp.settings.debug = bool(config.mcp.debug)
-    mcp.run(transport=os.getenv("SHS_MCP_TRANSPORT", config.mcp.transports[0]))
+    transport = os.getenv("SHS_MCP_TRANSPORT")
+    if not transport:
+        transport = config.mcp.transports[0] if config.mcp.transports else "stdio"
+    mcp.run(transport=transport)
 
 
 mcp = FastMCP("Spark Events", lifespan=app_lifespan)

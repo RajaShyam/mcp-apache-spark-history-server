@@ -26,6 +26,10 @@ class ServerConfig(BaseSettings):
     default: bool = False
     verify_ssl: bool = True
     emr_cluster_arn: Optional[str] = None  # EMR specific field
+    # S3 log access configuration
+    s3_log_bucket: Optional[str] = None  # S3 bucket for executor logs (e.g., "aws-logs-account-region")
+    s3_log_path_pattern: Optional[str] = None  # Path pattern (e.g., "elasticmapreduce/{cluster_id}/containers/")
+    aws_profile: Optional[str] = None  # Optional AWS profile for S3/EMR access (falls back to default credentials)
     use_proxy: bool = False
     timeout: int = 30  # HTTP request timeout in seconds
 

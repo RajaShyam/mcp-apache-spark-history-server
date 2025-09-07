@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "spark-history-server": {
+      "command": "echo",
+      "args": ["MCP Server"],
+      "transport": {
+        "type": "http",
+        "url": "http://localhost:18888"
+      }
+    }
+  }
+}

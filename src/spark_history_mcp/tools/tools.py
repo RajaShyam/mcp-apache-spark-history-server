@@ -1,6 +1,8 @@
 import heapq
 from typing import Any, Dict, List, Optional
 
+import boto3
+
 from spark_history_mcp.core.app import mcp
 from spark_history_mcp.models.mcp_types import (
     JobSummary,
@@ -1247,3 +1249,553 @@ def get_resource_usage_timeline(
             "peak_cores": max([r["total_cores"] for r in resource_timeline] + [0]),
         },
     }
+
+
+@mcp.tool()
+def get_executor_logs(
+    app_id: str,
+    executor_id: Optional[str] = None,
+    log_type: str = "stderr",
+    lines: int = 100,
+    search_pattern: Optional[str] = None,
+    max_executors: int = 5,
+    server: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Comprehensive executor log analysis tool for Spark applications.
+    
+    This unified tool intelligently handles multiple scenarios:
+    - Single executor analysis: Provide executor_id for specific executor logs
+    - Cross-executor search: Provide search_pattern to find patterns across executors  
+    - Error analysis: Leave both blank for comprehensive error analysis across executors
+    - Combined: Both executor_id + search_pattern for targeted search within one executor
+    
+    Uses smart hybrid approach: tries History Server API first, then falls back to S3
+    for EMR clusters. Works for both active and terminated clusters automatically.
+
+    Args:
+        app_id: The Spark application ID
+        executor_id: Specific executor ID (e.g., 'driver', '1', '2'). If not provided, analyzes multiple executors
+        log_type: Log type ('stderr', 'stdout', 'log4j')
+        lines: Approximate number of lines to retrieve per executor
+        search_pattern: Text pattern to search for. If provided, searches across executors
+        max_executors: Maximum number of executors to analyze (when doing multi-executor analysis)
+        server: Optional server name to use (uses default if not specified)
+
+    Returns:
+        Dictionary with comprehensive analysis results based on the parameters provided
+    """
+    ctx = mcp.get_context()
+    client = get_client_or_default(ctx, server)
+
+    # Determine analysis mode based on parameters
+    if executor_id and search_pattern:
+        mode = "single_executor_search"
+    elif executor_id and not search_pattern:
+        mode = "single_executor_analysis" 
+    elif search_pattern and not executor_id:
+        mode = "cross_executor_search"
+    else:
+        mode = "comprehensive_error_analysis"
+
+    try:
+        result = {
+            "application_id": app_id,
+            "analysis_mode": mode,
+            "log_type": log_type,
+            "parameters": {
+                "executor_id": executor_id,
+                "search_pattern": search_pattern,
+                "max_executors": max_executors,
+                "lines": lines
+            }
+        }
+
+        if mode == "single_executor_analysis":
+            # Single executor detailed analysis
+            estimated_bytes = max(lines * 120, 1000)
+            log_result = client.get_executor_log_content_hybrid(
+                app_id=app_id,
+                executor_id=executor_id,
+                log_type=log_type,
+                length=estimated_bytes
+            )
+            
+            log_content = log_result.get("content") or ""
+            if not log_content:
+                result["error"] = f"No log content available. {log_result.get('error', 'Unknown error')}"
+                result["source"] = log_result.get("source", "unknown")
+                result["suggestion"] = "Try 'diagnose_log_access' to understand log availability"
+                return result
+
+            # Detailed single executor analysis
+            log_lines = log_content.splitlines()
+            error_count = sum(1 for line in log_lines if 'ERROR' in line.upper())
+            warn_count = sum(1 for line in log_lines if 'WARN' in line.upper())
+            info_count = sum(1 for line in log_lines if 'INFO' in line.upper())
+            
+            # Extract recent errors
+            error_keywords = ['ERROR', 'EXCEPTION', 'FAILED', 'FATAL', 'OUTOFMEMORYERROR']
+            recent_errors = []
+            for i, line in enumerate(log_lines):
+                line_upper = line.upper()
+                if any(keyword in line_upper for keyword in error_keywords):
+                    recent_errors.append({
+                        "line_number": i + 1,
+                        "content": line.strip()
+                    })
+            recent_errors = recent_errors[-10:]
+
+            result.update({
+                "executor_id": executor_id,
+                "content": log_content,
+                "source": log_result.get("source", "unknown"),
+                "analysis": {
+                    "total_lines": len(log_lines),
+                    "error_count": error_count,
+                    "warning_count": warn_count,
+                    "info_count": info_count,
+                    "recent_errors": recent_errors,
+                    "has_out_of_memory": any("OUTOFMEMORYERROR" in line.upper() for line in log_lines),
+                    "has_serialization_error": any("NOTSERIALIZABLEEXCEPTION" in line.upper() for line in log_lines)
+                }
+            })
+
+        elif mode == "single_executor_search":
+            # Search within specific executor logs
+            matches = client.search_executor_logs(
+                app_id=app_id,
+                search_pattern=search_pattern,
+                log_type=log_type,
+                max_executors=1,
+                max_lines_per_executor=lines
+            )
+            
+            # Filter for the specific executor
+            executor_matches = [m for m in matches if m.get("executor_id") == executor_id and "error" not in m]
+            
+            result.update({
+                "executor_id": executor_id,
+                "search_results": {
+                    "pattern": search_pattern,
+                    "total_matches": sum(len(m.get("matches", [])) for m in executor_matches),
+                    "matches": executor_matches[0].get("matches", []) if executor_matches else [],
+                    "context": executor_matches[0] if executor_matches else None
+                }
+            })
+
+        elif mode == "cross_executor_search":
+            # Search across multiple executors
+            matches = client.search_executor_logs(
+                app_id=app_id,
+                search_pattern=search_pattern,
+                log_type=log_type,
+                max_executors=max_executors
+            )
+            
+            successful_matches = [m for m in matches if "error" not in m]
+            error_results = [m for m in matches if "error" in m]
+            
+            total_matches = sum(len(m.get("matches", [])) for m in successful_matches)
+            affected_executors = list(set(m["executor_id"] for m in successful_matches))
+            
+            result.update({
+                "search_results": {
+                    "pattern": search_pattern,
+                    "total_matches": total_matches,
+                    "affected_executors": affected_executors,
+                    "executors_searched": len(matches),
+                    "successful_searches": len(successful_matches),
+                    "executor_results": successful_matches[:5],  # Show top 5
+                    "errors": error_results if error_results else None
+                }
+            })
+
+        else:  # comprehensive_error_analysis
+            # Comprehensive error analysis across executors
+            error_patterns = {
+                "out_of_memory": {
+                    "patterns": ["OutOfMemoryError", "Java heap space", "GC overhead limit"],
+                    "category": "Memory",
+                    "severity": "High",
+                    "recommendation": "Increase executor memory (spark.executor.memory) or reduce partition size"
+                },
+                "serialization": {
+                    "patterns": ["NotSerializableException", "Task not serializable"],
+                    "category": "Serialization", 
+                    "severity": "High",
+                    "recommendation": "Review closures and broadcast variables; avoid referencing non-serializable objects"
+                },
+                "network_timeout": {
+                    "patterns": ["TimeoutException", "Connection timeout", "shuffle fetch failed"],
+                    "category": "Network",
+                    "severity": "Medium", 
+                    "recommendation": "Increase network timeout settings or check cluster network connectivity"
+                },
+                "data_corruption": {
+                    "patterns": ["CorruptRecordException", "Invalid input", "Malformed"],
+                    "category": "Data Quality",
+                    "severity": "Medium",
+                    "recommendation": "Check input data quality and add data validation steps"
+                },
+                "resource_starvation": {
+                    "patterns": ["executor killed", "executor lost", "Container killed"],
+                    "category": "Resources",
+                    "severity": "High", 
+                    "recommendation": "Check resource allocation and increase executor resources if needed"
+                }
+            }
+
+            categorized_errors = {}
+            total_matches = 0
+
+            # Search for each error pattern
+            for error_type, config in error_patterns.items():
+                pattern_matches = []
+                
+                for pattern in config["patterns"]:
+                    try:
+                        matches = client.search_executor_logs(
+                            app_id=app_id,
+                            search_pattern=pattern,
+                            log_type=log_type,
+                            max_executors=max_executors
+                        )
+                        successful_matches = [
+                            {**match, "matched_pattern": pattern} 
+                            for match in matches 
+                            if "error" not in match
+                        ]
+                        pattern_matches.extend(successful_matches)
+                    except Exception:
+                        continue
+                
+                if pattern_matches:
+                    categorized_errors[error_type] = {
+                        "category": config["category"],
+                        "severity": config["severity"],
+                        "recommendation": config["recommendation"],
+                        "match_count": len(pattern_matches),
+                        "affected_executors": list(set(m["executor_id"] for m in pattern_matches)),
+                        "sample_errors": pattern_matches[:3]
+                    }
+                    total_matches += len(pattern_matches)
+
+            critical_issues = [
+                error_type for error_type, info in categorized_errors.items()
+                if info["severity"] == "High"
+            ]
+
+            result.update({
+                "error_analysis": {
+                    "total_error_patterns_found": len(categorized_errors),
+                    "total_error_instances": total_matches,
+                    "critical_issues_count": len(critical_issues),
+                    "analyzed_executors": max_executors,
+                    "error_categories": categorized_errors,
+                    "recommendations": [
+                        {
+                            "priority": info["severity"],
+                            "category": info["category"],
+                            "issue": error_type.replace("_", " ").title(),
+                            "action": info["recommendation"],
+                            "affected_executors": len(info["affected_executors"])
+                        }
+                        for error_type, info in categorized_errors.items()
+                    ],
+                    "next_steps": [
+                        "Review critical issues first (High severity)",
+                        "Check executor resource allocation if memory or resource issues found",
+                        "Examine data quality if corruption errors detected",
+                        "Consider network configuration if timeout errors present"
+                    ] if categorized_errors else ["No common error patterns detected in logs"]
+                }
+            })
+
+        return result
+
+    except Exception as e:
+        return {
+            "application_id": app_id,
+            "analysis_mode": mode,
+            "error": f"Failed to analyze logs: {str(e)}",
+            "suggestion": "Check application ID and ensure log access is configured properly"
+        }
+
+
+@mcp.tool()
+def get_application_logs_summary(
+    app_id: str, server: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Get comprehensive summary of all available logs for a Spark application.
+    
+    Provides an overview of which executors have logs available, what types of logs
+    exist, and metadata about executor status. Useful for discovering what logs
+    are available before retrieving specific log content.
+
+    Args:
+        app_id: The Spark application ID
+        server: Optional server name to use (uses default if not specified)
+
+    Returns:
+        Summary of available logs across all executors with metadata
+    """
+    ctx = mcp.get_context()
+    client = get_client_or_default(ctx, server)
+
+    try:
+        return client.get_application_logs_summary(app_id)
+    except Exception as e:
+        return {
+            "error": f"Failed to get logs summary: {str(e)}",
+            "application_id": app_id
+        }
+
+
+
+
+
+
+
+
+@mcp.tool()
+def diagnose_log_access(
+    app_id: str,
+    server: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Diagnose log access issues and provide configuration recommendations.
+    
+    Checks what log access is available for a Spark application and provides
+    specific guidance on how to improve log accessibility for debugging.
+
+    Args:
+        app_id: The Spark application ID
+        server: Optional server name to use (uses default if not specified)
+
+    Returns:
+        Dictionary containing diagnosis and recommendations for log access
+    """
+    ctx = mcp.get_context()
+    client = get_client_or_default(ctx, server)
+
+    try:
+        # Get application info first
+        app_info = client.get_application(app_id=app_id)
+        logs_summary = client.get_application_logs_summary(app_id)
+        
+        diagnosis = {
+            "application_id": app_id,
+            "application_name": getattr(app_info, 'name', 'Unknown'),
+            "log_availability": {
+                "total_executors": logs_summary.get("total_executors", 0),
+                "executors_with_logs": logs_summary.get("executors_with_logs", 0),
+                "available_log_types": logs_summary.get("log_types_available", [])
+            },
+            "diagnosis": [],
+            "recommendations": [],
+            "alternative_approaches": []
+        }
+        
+        # Analyze log availability
+        if logs_summary.get("executors_with_logs", 0) == 0:
+            diagnosis["diagnosis"].append("❌ No executor logs available through History Server")
+            diagnosis["diagnosis"].append("This is common in production environments")
+            
+            diagnosis["recommendations"].extend([
+                "🔧 Enable log aggregation in future Spark jobs:",
+                "   • spark.eventLog.enabled=true", 
+                "   • spark.eventLog.dir=s3a://your-bucket/spark-logs/ (for EMR)",
+                "   • spark.history.fs.logDirectory=s3a://your-bucket/spark-logs/",
+                "🏗️ For EMR clusters:",
+                "   • Enable 'Log aggregation' in EMR cluster configuration",
+                "   • Set appropriate S3 bucket for log storage",
+                "   • Ensure EMR service role has S3 write permissions"
+            ])
+            
+        elif logs_summary.get("executors_with_logs", 0) < logs_summary.get("total_executors", 1):
+            diagnosis["diagnosis"].append("⚠️ Partial log availability - some executors missing logs")
+            diagnosis["recommendations"].append("Some executors may have failed before logs were written")
+            
+        else:
+            diagnosis["diagnosis"].append("✅ Executor logs appear to be available")
+            
+            # Test actual log access
+            executor_logs = logs_summary.get("executor_logs", {})
+            if executor_logs:
+                first_executor = next(iter(executor_logs.keys()))
+                try:
+                    test_content = client.get_executor_log_content(
+                        app_id=app_id, 
+                        executor_id=first_executor, 
+                        log_type="stderr",
+                        length=100
+                    )
+                    if test_content and len(test_content.strip()) > 0:
+                        diagnosis["diagnosis"].append("✅ Log content is accessible")
+                    else:
+                        diagnosis["diagnosis"].append("⚠️ Log URLs exist but content is empty")
+                        
+                except Exception as e:
+                    diagnosis["diagnosis"].append(f"❌ Log content not accessible: {str(e)}")
+        
+        # Always provide alternative approaches
+        diagnosis["alternative_approaches"].extend([
+            "📊 Use performance analysis tools:",
+            "   • get_job_bottlenecks() - Find performance issues",
+            "   • list_slowest_stages() - Identify slow operations", 
+            "   • get_stage_task_summary() - Analyze task performance",
+            "📈 Examine application metrics:",
+            "   • Application timeline and resource usage",
+            "   • Stage-level execution patterns",
+            "   • Task failure analysis without raw logs"
+        ])
+        
+        # Add configuration check if we have application info
+        if hasattr(app_info, 'spark_properties') or hasattr(app_info, 'environment'):
+            diagnosis["recommendations"].insert(0, "🔍 Check current application configuration for log settings")
+            
+        return diagnosis
+        
+    except Exception as e:
+        return {
+            "error": f"Failed to diagnose log access: {str(e)}",
+            "application_id": app_id,
+            "suggestion": "Try using get_application_logs_summary() for basic log availability info"
+        }
+
+
+
+
+
+
+
+
+
+
+
+@mcp.tool()
+def inspect_s3_log_configuration(
+    server: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Inspect and debug S3 log configuration discovery process.
+    
+    Shows how the system determines S3 bucket and path patterns, including
+    what was auto-discovered vs configured vs defaulted. Useful for understanding
+    why certain S3 paths are being used and troubleshooting access issues.
+
+    Args:
+        server: Optional server name to use (uses default if not specified)
+
+    Returns:
+        Dictionary showing configuration discovery process and results
+    """
+    ctx = mcp.get_context()
+    client = get_client_or_default(ctx, server)
+
+    try:
+        cluster_id = client._extract_emr_cluster_id()
+        
+        result = {
+            "emr_configuration": {
+                "cluster_arn": client.config.emr_cluster_arn,
+                "cluster_id": cluster_id,
+                "region": client.config.emr_cluster_arn.split(":")[3] if client.config.emr_cluster_arn else None,
+                "account_id": client.config.emr_cluster_arn.split(":")[4] if client.config.emr_cluster_arn else None
+            },
+            "explicit_configuration": {
+                "s3_log_bucket": client.config.s3_log_bucket,
+                "s3_log_path_pattern": client.config.s3_log_path_pattern
+            },
+            "auto_discovery": {},
+            "final_configuration": {},
+            "configuration_source": None,
+            "example_paths": {}
+        }
+        
+        if not cluster_id:
+            result["error"] = "No EMR cluster ARN configured - cannot determine S3 log paths"
+            return result
+            
+        # Try auto-discovery
+        try:
+            discovered = client._discover_s3_log_configuration()
+            result["auto_discovery"] = {
+                "bucket": discovered.get("bucket"),
+                "path_pattern": discovered.get("path_pattern"),
+                "environment": discovered.get("environment"),
+                "cluster_name": discovered.get("cluster_name"),
+                "success": bool(discovered.get("bucket"))
+            }
+        except Exception as e:
+            result["auto_discovery"] = {
+                "error": str(e),
+                "success": False
+            }
+        
+        # Get final configuration
+        final_config = client._get_s3_log_configuration()
+        result["final_configuration"] = final_config
+        
+        # Determine source
+        if client.config.s3_log_bucket:
+            result["configuration_source"] = "explicit_configuration"
+        elif result["auto_discovery"].get("success"):
+            result["configuration_source"] = "auto_discovery"
+        else:
+            result["configuration_source"] = "smart_defaults"
+            
+        # Generate example paths
+        if final_config.get("bucket"):
+            sample_app_id = "application_1234567890123_0001"
+            result["example_paths"] = {
+                "driver_stderr": client._build_s3_log_path(sample_app_id, "driver", "stderr"),
+                "executor_1_stderr": client._build_s3_log_path(sample_app_id, "1", "stderr"),
+                "driver_stdout": client._build_s3_log_path(sample_app_id, "driver", "stdout")
+            }
+        
+        # Add recommendations
+        recommendations = []
+        
+        if result["configuration_source"] == "smart_defaults":
+            recommendations.append(
+                "⚠️ Using smart defaults - may not work for all EMR setups"
+            )
+            recommendations.append(
+                "💡 Consider adding explicit s3_log_bucket to your configuration"
+            )
+            
+        if result["configuration_source"] == "auto_discovery":
+            recommendations.append(
+                "✅ Auto-discovered from EMR cluster configuration"
+            )
+            if result["auto_discovery"].get("environment"):
+                recommendations.append(
+                    f"🎯 Environment '{result['auto_discovery']['environment']}' detected from cluster name"
+                )
+            recommendations.append(
+                "💡 Configuration working automatically - no manual setup needed"
+            )
+            
+        if result["configuration_source"] == "explicit_configuration":
+            recommendations.append(
+                "✅ Using explicit configuration from config.yaml"
+            )
+            recommendations.append(
+                "🎯 Configuration is fully under your control"
+            )
+            
+        result["recommendations"] = recommendations
+        
+        return result
+        
+    except Exception as e:
+        return {
+            "error": f"Failed to inspect S3 configuration: {str(e)}",
+            "suggestion": "Check EMR cluster ARN configuration"
+        }
+
+
+

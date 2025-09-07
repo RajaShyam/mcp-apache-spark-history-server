@@ -12,7 +12,9 @@ from spark_history_mcp.models.spark_types import (
 )
 from spark_history_mcp.tools.tools import (
     get_application,
+    get_application_logs_summary,
     get_client_or_default,
+    get_executor_logs,
     get_stage,
     get_stage_task_summary,
     list_applications,
@@ -1153,3 +1155,319 @@ class TestTools(unittest.TestCase):
         self.assertEqual(result[0].duration, 10000)
         self.assertEqual(result[1].duration, 9000)
         self.assertEqual(result[2].duration, 8000)
+
+    # Tests for log retrieval tools
+    @patch("spark_history_mcp.tools.tools.mcp.get_context")
+    @patch("spark_history_mcp.tools.tools.get_client_or_default")
+    def test_get_executor_logs_success(self, mock_get_client, mock_get_context):
+        """Test successful executor log retrieval with analysis"""
+        # Setup mock context and client
+        mock_context = MagicMock()
+        mock_get_context.return_value = mock_context
+        mock_client = MagicMock()
+        sample_log_content = """2024-01-01 10:00:01 INFO TaskSetManager: Starting task 1.0
+2024-01-01 10:00:02 ERROR TaskSetManager: Lost task 1.0 due to OutOfMemoryError
+2024-01-01 10:00:03 WARN TaskSetManager: Task 1.0 failed, retrying
+2024-01-01 10:00:04 ERROR Executor: Exception in task
+java.lang.OutOfMemoryError: Java heap space
+2024-01-01 10:00:05 INFO TaskSetManager: Task completed successfully"""
+        mock_client.get_executor_log_content.return_value = sample_log_content
+        mock_get_client.return_value = mock_client
+
+        # Call the function
+        result = get_executor_logs("app-123", "driver", "stderr", lines=50)
+
+        # Verify the result structure matches actual implementation
+        self.assertIsInstance(result, dict)
+        self.assertIn("content", result)
+        self.assertIn("analysis", result)
+        self.assertIn("application_id", result)
+        self.assertIn("executor_id", result)
+        self.assertIn("log_type", result)
+
+        # Verify analysis results
+        analysis = result["analysis"]
+        self.assertEqual(analysis["error_count"], 3)  # ERROR + OUTOFMEMORYERROR counted
+        self.assertEqual(analysis["warning_count"], 1)  
+        self.assertEqual(analysis["info_count"], 2)
+        self.assertEqual(analysis["total_lines"], 6)
+        self.assertTrue(analysis["has_out_of_memory"])
+
+        # Verify metadata
+        self.assertEqual(result["application_id"], "app-123")
+        self.assertEqual(result["executor_id"], "driver")
+        self.assertEqual(result["log_type"], "stderr")
+
+        # Verify client was called correctly
+        mock_get_client.assert_called_once_with(mock_context, None)
+        mock_client.get_executor_log_content.assert_called_once_with(
+            app_id="app-123",
+            executor_id="driver",
+            log_type="stderr",
+            length=6000  # 50 * 120
+        )
+
+    @patch("spark_history_mcp.tools.tools.mcp.get_context")
+    @patch("spark_history_mcp.tools.tools.get_client_or_default")
+    def test_get_executor_logs_with_custom_server(self, mock_get_client, mock_get_context):
+        """Test executor log retrieval with custom server"""
+        mock_context = MagicMock()
+        mock_get_context.return_value = mock_context
+        mock_client = MagicMock()
+        mock_client.get_executor_log_content.return_value = "Test log content"
+        mock_get_client.return_value = mock_client
+
+        result = get_executor_logs("app-123", "1", "stdout", lines=200, server="custom-server")
+
+        self.assertIsInstance(result, dict)
+        mock_get_client.assert_called_once_with(mock_context, "custom-server")
+        mock_client.get_executor_log_content.assert_called_once_with(
+            app_id="app-123",
+            executor_id="1",
+            log_type="stdout",
+            length=24000  # 200 * 120
+        )
+
+    @patch("spark_history_mcp.tools.tools.mcp.get_context")
+    @patch("spark_history_mcp.tools.tools.get_client_or_default")
+    def test_get_executor_logs_error_handling(self, mock_get_client, mock_get_context):
+        """Test error handling in executor log retrieval"""
+        mock_context = MagicMock()
+        mock_get_context.return_value = mock_context
+        mock_client = MagicMock()
+        mock_client.get_executor_log_content.side_effect = ValueError("Executor not found")
+        mock_get_client.return_value = mock_client
+
+        result = get_executor_logs("app-123", "nonexistent", "stderr")
+        
+        # Verify error is returned in result (not raised)
+        self.assertIsInstance(result, dict)
+        self.assertIn("error", result)
+        self.assertIn("Executor not found", result["error"])
+
+    @patch("spark_history_mcp.tools.tools.mcp.get_context")
+    @patch("spark_history_mcp.tools.tools.get_client_or_default")
+    def test_get_application_logs_summary_success(self, mock_get_client, mock_get_context):
+        """Test application logs summary retrieval"""
+        # Setup mock context and client
+        mock_context = MagicMock()
+        mock_get_context.return_value = mock_context
+        mock_client = MagicMock()
+        logs_summary = {
+            "application_id": "app-123",
+            "total_executors": 3,
+            "executors_with_logs": 2,
+            "log_types_available": ["stderr", "stdout"],
+            "executor_logs": {
+                "driver": {
+                    "stderr": "http://driver:4040/logs/stderr",
+                    "stdout": "http://driver:4040/logs/stdout"
+                },
+                "executor-1": {
+                    "stderr": "http://worker1:8081/logs/stderr"
+                }
+            }
+        }
+        mock_client.get_application_logs_summary.return_value = logs_summary
+        mock_get_client.return_value = mock_client
+
+        # Call the function
+        result = get_application_logs_summary("app-123")
+
+        # Verify the result
+        self.assertEqual(result, logs_summary)
+        mock_get_client.assert_called_once_with(mock_context, None)
+        mock_client.get_application_logs_summary.assert_called_once_with("app-123")
+
+    @patch("spark_history_mcp.tools.tools.mcp.get_context")
+    @patch("spark_history_mcp.tools.tools.get_client_or_default")
+    def test_get_application_logs_summary_with_server(self, mock_get_client, mock_get_context):
+        """Test application logs summary with custom server"""
+        mock_context = MagicMock()
+        mock_get_context.return_value = mock_context
+        mock_client = MagicMock()
+        logs_summary = {"application_id": "app-123", "total_executors": 0}
+        mock_client.get_application_logs_summary.return_value = logs_summary
+        mock_get_client.return_value = mock_client
+
+        result = get_application_logs_summary("app-123", server="test-server")
+
+        self.assertEqual(result, logs_summary)
+        mock_get_client.assert_called_once_with(mock_context, "test-server")
+
+    @patch("spark_history_mcp.tools.tools.mcp.get_context")
+    @patch("spark_history_mcp.tools.tools.get_client_or_default")
+    def test_search_application_logs_success(self, mock_get_client, mock_get_context):
+        """Test log search across application executors"""
+        # Setup mock context and client
+        mock_context = MagicMock()
+        mock_get_context.return_value = mock_context
+        mock_client = MagicMock()
+        
+        # Mock search_executor_logs returns a list of matches
+        search_results = [
+            {
+                "executor_id": "driver",
+                "line_number": 123,
+                "content": "2024-01-01 10:00:02 ERROR TaskSetManager: OutOfMemoryError occurred",
+                "log_type": "stderr"
+            },
+            {
+                "executor_id": "executor-1", 
+                "line_number": 45,
+                "content": "2024-01-01 10:00:01 ERROR Executor: OutOfMemoryError in task execution",
+                "log_type": "stderr"
+            }
+        ]
+        mock_client.search_executor_logs.return_value = search_results
+        mock_get_client.return_value = mock_client
+
+        # Call the function
+        result = search_application_logs("app-123", "OutOfMemoryError")
+
+        # Verify the result structure matches actual implementation
+        self.assertIsInstance(result, dict)
+        self.assertIn("application_id", result)
+        self.assertIn("search_pattern", result)
+        self.assertIn("log_type", result)
+        self.assertIn("total_matches", result)
+        self.assertIn("matches", result)
+
+        # Verify values
+        self.assertEqual(result["application_id"], "app-123")
+        self.assertEqual(result["search_pattern"], "OutOfMemoryError")
+        self.assertEqual(result["total_matches"], 2)
+        self.assertEqual(result["searched_executors"], 2)
+
+        # Verify client was called correctly (matches actual signature)
+        mock_client.search_executor_logs.assert_called_once_with(
+            app_id="app-123",
+            search_pattern="OutOfMemoryError", 
+            log_type="stderr",
+            max_executors=5
+        )
+
+    @patch("spark_history_mcp.tools.tools.mcp.get_context")  
+    @patch("spark_history_mcp.tools.tools.get_client_or_default")
+    def test_search_application_logs_with_options(self, mock_get_client, mock_get_context):
+        """Test log search with custom options"""
+        mock_context = MagicMock()
+        mock_get_context.return_value = mock_context
+        mock_client = MagicMock()
+        mock_client.search_executor_logs.return_value = []  # Empty list
+        mock_get_client.return_value = mock_client
+
+        result = search_application_logs(
+            "app-123",
+            "ERROR", 
+            log_type="stdout",
+            max_executors=3,
+            server="custom-server"
+        )
+
+        self.assertIsInstance(result, dict)
+        mock_get_client.assert_called_once_with(mock_context, "custom-server")
+        mock_client.search_executor_logs.assert_called_once_with(
+            app_id="app-123",
+            search_pattern="ERROR",
+            log_type="stdout",
+            max_executors=3
+        )
+
+    @patch("spark_history_mcp.tools.tools.mcp.get_context")
+    @patch("spark_history_mcp.tools.tools.get_client_or_default")
+    def test_search_application_logs_no_matches(self, mock_get_client, mock_get_context):
+        """Test log search with no matches found"""
+        mock_context = MagicMock()
+        mock_get_context.return_value = mock_context
+        mock_client = MagicMock()
+        mock_client.search_executor_logs.return_value = []  # Empty list
+        mock_get_client.return_value = mock_client
+
+        result = search_application_logs("app-123", "NonExistentPattern")
+
+        # Verify the result matches actual implementation
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result["total_matches"], 0)
+        self.assertEqual(result["searched_executors"], 0)
+        self.assertEqual(result["matches"], [])
+
+    @patch("spark_history_mcp.tools.tools.mcp.get_context")
+    @patch("spark_history_mcp.tools.tools.get_client_or_default")
+    def test_analyze_application_errors_success(self, mock_get_client, mock_get_context):
+        """Test comprehensive error analysis"""
+        # Setup mock context and client
+        mock_context = MagicMock()
+        mock_get_context.return_value = mock_context
+        mock_client = MagicMock()
+        
+        # Mock search_executor_logs to return different results for different patterns
+        def mock_search_side_effect(app_id, search_pattern, log_type, max_executors):
+            if "OutOfMemoryError" in search_pattern:
+                return [
+                    {"executor_id": "driver", "line_number": 100, "content": "OutOfMemoryError: Java heap space"},
+                    {"executor_id": "executor-1", "line_number": 200, "content": "java.lang.OutOfMemoryError"}
+                ]
+            elif "TimeoutException" in search_pattern:
+                return [
+                    {"executor_id": "executor-2", "line_number": 50, "content": "TimeoutException occurred"}
+                ]
+            else:
+                return []
+        
+        mock_client.search_executor_logs.side_effect = mock_search_side_effect
+        mock_get_client.return_value = mock_client
+
+        # Call the function
+        result = analyze_application_errors("app-123")
+
+        # Verify the result structure matches actual implementation
+        self.assertIsInstance(result, dict)
+        self.assertIn("application_id", result)
+        self.assertIn("analysis_summary", result)  # Not "summary"
+        self.assertIn("error_categories", result)  # Not "error_analysis"
+        self.assertIn("recommendations", result)
+        self.assertIn("next_steps", result)
+
+        # Verify analysis summary structure 
+        analysis_summary = result["analysis_summary"]
+        self.assertIn("total_error_patterns_found", analysis_summary)
+        self.assertIn("total_error_instances", analysis_summary)
+        self.assertIn("critical_issues_count", analysis_summary)
+
+        # Verify that multiple searches were performed (5 error categories with multiple patterns each)
+        self.assertGreater(mock_client.search_executor_logs.call_count, 10)
+
+    @patch("spark_history_mcp.tools.tools.mcp.get_context")
+    @patch("spark_history_mcp.tools.tools.get_client_or_default")
+    def test_analyze_application_errors_with_server(self, mock_get_client, mock_get_context):
+        """Test error analysis with custom server"""
+        mock_context = MagicMock()
+        mock_get_context.return_value = mock_context
+        mock_client = MagicMock()
+        mock_client.search_executor_logs.return_value = []  # Empty list
+        mock_get_client.return_value = mock_client
+
+        result = analyze_application_errors("app-123", server="error-server")
+
+        self.assertIsInstance(result, dict)
+        mock_get_client.assert_called_once_with(mock_context, "error-server")
+
+    @patch("spark_history_mcp.tools.tools.mcp.get_context")
+    @patch("spark_history_mcp.tools.tools.get_client_or_default")
+    def test_analyze_application_errors_no_errors_found(self, mock_get_client, mock_get_context):
+        """Test error analysis when no errors are found"""
+        mock_context = MagicMock()
+        mock_get_context.return_value = mock_context
+        mock_client = MagicMock()
+        mock_client.search_executor_logs.return_value = []  # Empty list for all searches
+        mock_get_client.return_value = mock_client
+
+        result = analyze_application_errors("app-123")
+
+        # Verify the result indicates no errors found (matches actual implementation)
+        self.assertIsInstance(result, dict)
+        analysis_summary = result["analysis_summary"]
+        self.assertEqual(analysis_summary["total_error_patterns_found"], 0)
+        self.assertEqual(analysis_summary["total_error_instances"], 0)
+        self.assertIn("No common error patterns detected", result["next_steps"][0])

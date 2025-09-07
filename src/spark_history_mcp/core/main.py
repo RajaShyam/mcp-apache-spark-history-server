@@ -19,12 +19,17 @@ def main():
     try:
         logger.info("Starting Spark History Server MCP...")
         config = Config.from_file("config.yaml")
+        logger.info(f"Loaded servers: {list(config.servers.keys())}")
+        for name, server_config in config.servers.items():
+            logger.info(f"Server '{name}': EMR ARN={server_config.emr_cluster_arn}")
         if config.mcp.debug:
             logger.setLevel(logging.DEBUG)
         logger.debug(json.dumps(json.loads(config.model_dump_json()), indent=4))
         app.run(config)
     except Exception as e:
         logger.error(f"Failed to start MCP server: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         sys.exit(1)
 
 

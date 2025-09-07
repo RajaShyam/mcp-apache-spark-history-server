@@ -2,6 +2,7 @@ import re
 from typing import Any, Dict, List, Optional, Type, TypeVar
 from urllib.parse import urljoin
 
+import boto3
 import requests
 from pydantic import BaseModel
 
@@ -668,3 +669,526 @@ class SparkRestClient:
 
         data = self._get(endpoint, params)
         return ExecutionData.from_dict(data)
+
+    def get_executor_log_content(
+        self,
+        app_id: str,
+        executor_id: str,
+        log_type: str = "stderr",
+        offset: int = 0,
+        length: int = 10000,
+    ) -> str:
+        """
+        Retrieve actual log content from executor logs using Spark REST API.
+
+        Args:
+            app_id: The application ID
+            executor_id: The executor ID
+            log_type: Type of log ('stderr', 'stdout', 'log4j')
+            offset: Starting byte offset
+            length: Number of bytes to retrieve
+
+        Returns:
+            Raw log content as string
+
+        Raises:
+            ValueError: If executor or log type not found
+            requests.exceptions.RequestException: If log retrieval fails
+        """
+
+        # Build Spark REST API endpoint for logs
+        endpoint = f"/applications/{app_id}/executors/{executor_id}/logs/{log_type}"
+        
+        # Add pagination parameters if specified
+        params = {}
+        if offset > 0:
+            params['offset'] = offset
+        if length != 10000:
+            params['length'] = length
+
+        try:
+            response = self._get(endpoint, params)
+            return response if isinstance(response, str) else str(response)
+            
+        except Exception as e:
+            error_msg = str(e)
+            
+            if "404" in error_msg or "Not Found" in error_msg:
+                raise ValueError(
+                    f"Executor '{executor_id}' or log type '{log_type}' not found. "
+                    f"Common causes:\n"
+                    f"• Executor doesn't exist in application '{app_id}'\n"
+                    f"• Log aggregation was not enabled when the application ran\n"
+                    f"• Logs have been cleaned up by retention policies\n"
+                    f"• EMR/cluster configuration doesn't persist executor logs\n"
+                    f"\nTip: Use 'get_application_logs_summary' to see what logs are actually available."
+                ) from e
+            else:
+                raise ValueError(
+                    f"Failed to retrieve log content for executor '{executor_id}' log type '{log_type}'. "
+                    f"Error: {error_msg}. "
+                    f"This could indicate network issues, authentication problems, or server errors."
+                ) from e
+
+    def _extract_emr_cluster_id(self) -> Optional[str]:
+        """Extract EMR cluster ID from cluster ARN if available."""
+        if not self.config.emr_cluster_arn:
+            return None
+        
+        # EMR ARN format: arn:aws:elasticmapreduce:region:account:cluster/j-XXXXXXXXXXXXX
+        arn_parts = self.config.emr_cluster_arn.split("/")
+        if len(arn_parts) >= 2 and arn_parts[-1].startswith("j-"):
+            return arn_parts[-1]  # Returns j-XXXXXXXXXXXXX
+        return None
+
+    def _extract_environment_from_cluster_name(self, cluster_name: str) -> Optional[str]:
+        """
+        Extract environment from cluster name using your organization's naming patterns.
+        
+        Supports patterns like:
+        - cluster-name-prod
+        - cluster-name-preprod  
+        - cluster-name-dev
+        - cluster-name-lab
+        """
+        if not cluster_name:
+            return None
+            
+        # Environment suffixes (in priority order)
+        env_patterns = [
+            "prod",
+            "preprod", 
+            "dev",
+            "lab"
+        ]
+        
+        # Try to extract environment from end of cluster name
+        cluster_lower = cluster_name.lower()
+        
+        for env in env_patterns:
+            # Check for patterns: -env, _env, or just env at the end
+            if cluster_lower.endswith(f"-{env}"):
+                return env
+            elif cluster_lower.endswith(f"_{env}"):
+                return env
+            elif cluster_lower.endswith(env) and len(cluster_lower) > len(env):
+                # Make sure it's actually a suffix, not part of another word
+                separator_pos = len(cluster_lower) - len(env) - 1
+                if separator_pos >= 0 and cluster_lower[separator_pos] in ["-", "_"]:
+                    return env
+        
+        return None
+
+    def _discover_s3_log_configuration(self) -> Dict[str, Optional[str]]:
+        """
+        Auto-discover S3 log configuration from EMR cluster if possible.
+        
+        Returns:
+            Dict with 'bucket', 'path_pattern', 'environment', and 'cluster_name' keys
+        """
+        result = {
+            "bucket": None, 
+            "path_pattern": None, 
+            "environment": None,
+            "cluster_name": None
+        }
+        
+        cluster_id = self._extract_emr_cluster_id()
+        if not cluster_id:
+            return result
+            
+        try:
+            # Try to get EMR cluster configuration with profile if configured
+            region = self.config.emr_cluster_arn.split(":")[3]
+            if self.config.aws_profile:
+                session = boto3.Session(profile_name=self.config.aws_profile)
+                emr_client = session.client("emr", region_name=region)
+            else:
+                emr_client = boto3.client("emr", region_name=region)
+            
+            # Get cluster details
+            response = emr_client.describe_cluster(ClusterId=cluster_id)
+            cluster = response.get("Cluster", {})
+            
+            # Extract cluster name and environment
+            cluster_name = cluster.get("Name", "")
+            result["cluster_name"] = cluster_name
+            
+            environment = self._extract_environment_from_cluster_name(cluster_name)
+            result["environment"] = environment
+            
+            # Look for log URI in cluster configuration
+            log_uri = cluster.get("LogUri")
+            if log_uri and log_uri.startswith("s3://"):
+                # Extract bucket from log URI like s3://bucket-name/path/
+                log_parts = log_uri.replace("s3://", "").split("/", 1)
+                result["bucket"] = log_parts[0]
+                
+                # Try to detect existing path pattern first
+                detected_pattern = None
+                if len(log_parts) > 1:
+                    base_path = log_parts[1].rstrip("/") + "/"
+                    # Check if path contains cluster ID to build pattern
+                    if cluster_id in base_path:
+                        detected_pattern = base_path.replace(cluster_id, "{cluster_id}")
+                        # If environment was detected and path doesn't include it, enhance the pattern
+                        if environment and environment not in detected_pattern:
+                            # Try to insert environment into common patterns
+                            if "elasticmapreduce/{cluster_id}" in detected_pattern:
+                                detected_pattern = detected_pattern.replace(
+                                    "elasticmapreduce/{cluster_id}",
+                                    f"elasticmapreduce/{environment}/{{cluster_id}}"
+                                )
+                
+                # Use detected pattern or build environment-aware pattern
+                if detected_pattern:
+                    result["path_pattern"] = detected_pattern
+                elif environment:
+                    # Environment-aware patterns based on common conventions
+                    env_patterns = [
+                        f"emr_clusters/{environment}/{{cluster_id}}/containers/",  # Most common
+                        f"elasticmapreduce/{environment}/{{cluster_id}}/containers/",  # AWS with env
+                        f"{environment}/elasticmapreduce/{{cluster_id}}/containers/",  # Env first
+                        f"emr/{environment}/{{cluster_id}}/containers/",  # Short form
+                    ]
+                    result["path_pattern"] = env_patterns[0]  # Use most common as default
+                else:
+                    # Fallback to standard patterns
+                    result["path_pattern"] = "elasticmapreduce/{cluster_id}/containers/"
+                
+        except Exception:
+            # Auto-discovery failed, will fall back to defaults/config
+            pass
+            
+        return result
+
+    def _get_s3_log_configuration(self) -> Dict[str, Optional[str]]:
+        """
+        Get S3 log configuration using layered approach:
+        1. Explicit configuration (highest priority)
+        2. Auto-discovery from EMR
+        3. Smart defaults
+        """
+        config = {"bucket": None, "path_pattern": None}
+        
+        # Layer 1: Explicit configuration (highest priority)
+        if self.config.s3_log_bucket:
+            config["bucket"] = self.config.s3_log_bucket
+            config["path_pattern"] = (
+                self.config.s3_log_path_pattern or 
+                "elasticmapreduce/{cluster_id}/containers/"
+            )
+            return config
+        
+        # Layer 2: Auto-discovery
+        discovered = self._discover_s3_log_configuration()
+        if discovered["bucket"]:
+            config["bucket"] = discovered["bucket"]
+            config["path_pattern"] = (
+                discovered["path_pattern"] or 
+                "elasticmapreduce/{cluster_id}/containers/"
+            )
+            return config
+            
+        # Layer 3: Smart defaults (AWS standard patterns)
+        cluster_id = self._extract_emr_cluster_id()
+        if cluster_id:
+            # Try common AWS account patterns
+            region = self.config.emr_cluster_arn.split(":")[3]
+            account_id = self.config.emr_cluster_arn.split(":")[4]
+            
+            config["bucket"] = f"aws-logs-{account_id}-{region}"
+            config["path_pattern"] = "elasticmapreduce/{cluster_id}/containers/"
+            
+        return config
+
+    def _build_s3_log_path(self, app_id: str, executor_id: str, log_type: str = "stderr") -> Optional[str]:
+        """Build S3 path for executor logs using smart configuration discovery."""
+        cluster_id = self._extract_emr_cluster_id()
+        if not cluster_id:
+            return None
+        
+        config = self._get_s3_log_configuration()
+        if not config["bucket"]:
+            return None
+        
+        # Build the full path with correct EMR container naming
+        path = config["path_pattern"].format(cluster_id=cluster_id)
+        
+        # EMR containers follow pattern: container_{app_id}_01_{executor_padded}
+        # Extract numeric part from app_id and executor_id for container naming
+        app_numeric = app_id.replace("application_", "")
+        
+        # Safely parse executor_id - handle both numeric and string formats
+        try:
+            if isinstance(executor_id, str) and executor_id.isdigit():
+                executor_num = int(executor_id)
+            elif isinstance(executor_id, int):
+                executor_num = executor_id
+            else:
+                # Handle executor IDs like "driver", "1", etc.
+                # For driver, use 1; for others try to extract numbers
+                if executor_id.lower() == "driver":
+                    executor_num = 1
+                else:
+                    # Extract any digits from the executor_id
+                    import re
+                    digits = re.findall(r'\d+', str(executor_id))
+                    executor_num = int(digits[0]) if digits else 1
+            
+            executor_padded = f"{executor_num:06d}"  # Convert to 6-digit padded format
+        except (ValueError, IndexError) as e:
+            raise ValueError(f"Cannot parse executor_id '{executor_id}': {e}. Expected numeric value or 'driver'.")
+        container_name = f"container_{app_numeric}_01_{executor_padded}"
+        
+        # Logs are gzipped in EMR
+        log_file = f"{log_type}.gz"
+        
+        s3_path = f"s3://{config['bucket']}/{path}{app_id}/{container_name}/{log_file}"
+        return s3_path
+
+    def get_executor_log_content_from_s3(
+        self,
+        app_id: str,
+        executor_id: str,
+        log_type: str = "stderr",
+        max_lines: int = 1000,
+    ) -> str:
+        """
+        Retrieve executor log content from S3 for EMR clusters.
+        
+        This method accesses logs directly from S3 when they're not available
+        through the Spark History Server API, which is common for terminated EMR clusters.
+
+        Args:
+            app_id: The application ID
+            executor_id: The executor ID
+            log_type: Type of log ('stderr', 'stdout')
+            max_lines: Maximum number of lines to retrieve from end of file
+
+        Returns:
+            Raw log content as string
+
+        Raises:
+            ValueError: If S3 access is not configured or logs not found
+        """
+        s3_path = self._build_s3_log_path(app_id, executor_id, log_type)
+        if not s3_path:
+            raise ValueError(
+                "S3 log access not configured. Required: emr_cluster_arn and s3_log_bucket in server config."
+            )
+        
+        try:
+            # Initialize S3 client with profile if configured
+            region = self.config.emr_cluster_arn.split(":")[3] if self.config.emr_cluster_arn else "us-east-1"
+            if self.config.aws_profile:
+                session = boto3.Session(profile_name=self.config.aws_profile)
+                s3_client = session.client("s3", region_name=region)
+            else:
+                s3_client = boto3.client("s3", region_name=region)
+            
+            # Parse S3 path
+            s3_parts = s3_path.replace("s3://", "").split("/", 1)
+            bucket = s3_parts[0]
+            key = s3_parts[1]
+            
+            # Try to get object (handle gzipped content)
+            response = s3_client.get_object(Bucket=bucket, Key=key)
+            content_bytes = response['Body'].read()
+            
+            # Handle gzipped content
+            if key.endswith('.gz'):
+                import gzip
+                content = gzip.decompress(content_bytes).decode('utf-8', errors='replace')
+            else:
+                content = content_bytes.decode('utf-8', errors='replace')
+            
+            # Return last N lines if content is long
+            lines = content.splitlines()
+            if len(lines) > max_lines:
+                content = '\n'.join(lines[-max_lines:])
+                content = f"... (showing last {max_lines} lines of {len(lines)} total lines)\n\n" + content
+            
+            return content
+            
+        except Exception as e:
+            error_msg = str(e)
+            if "NoSuchKey" in error_msg or "Not Found" in error_msg:
+                raise ValueError(
+                    f"Log file not found in S3: {s3_path}\n"
+                    f"This could mean:\n"
+                    f"• Logs were not configured to be stored in S3\n"
+                    f"• Log retention policy has cleaned up the files\n"
+                    f"• The S3 path pattern is incorrect for your EMR setup"
+                ) from e
+            elif "NoSuchBucket" in error_msg:
+                raise ValueError(
+                    f"S3 bucket not accessible: {bucket}\n"
+                    f"Check that the bucket exists and you have read permissions."
+                ) from e
+            else:
+                raise ValueError(
+                    f"Failed to access S3 logs: {error_msg}\n"
+                    f"S3 path: {s3_path}"
+                ) from e
+
+    def get_executor_log_content_hybrid(
+        self,
+        app_id: str,
+        executor_id: str,
+        log_type: str = "stderr",
+        offset: int = 0,
+        length: int = 10000,
+    ) -> Dict[str, Any]:
+        """
+        Hybrid method that tries History Server API first, then falls back to S3.
+        
+        Returns both content and metadata about the source.
+        """
+        result = {
+            "application_id": app_id,
+            "executor_id": executor_id,
+            "log_type": log_type,
+            "content": "",  # Initialize as empty string, not None
+            "source": None,
+            "error": None
+        }
+        
+        # Try History Server API first
+        try:
+            content = self.get_executor_log_content(app_id, executor_id, log_type, offset, length)
+            result["content"] = content or ""  # Ensure content is never None
+            result["source"] = "spark_history_server_api"
+            return result
+        except Exception as api_error:
+            result["error"] = f"API access failed: {str(api_error)}"
+            
+        # Fallback to S3 if configured
+        if self.config.emr_cluster_arn and self.config.s3_log_bucket:
+            try:
+                # Convert length to approximate lines for S3 access
+                estimated_lines = max(length // 120, 100)
+                content = self.get_executor_log_content_from_s3(
+                    app_id, executor_id, log_type, max_lines=estimated_lines
+                )
+                result["content"] = content or ""  # Ensure content is never None
+                result["source"] = "s3_direct_access"
+                result["error"] = None  # Clear the API error since S3 worked
+                return result
+            except Exception as s3_error:
+                result["error"] += f" | S3 fallback failed: {str(s3_error)}"
+        else:
+            result["error"] += " | S3 fallback not configured (missing emr_cluster_arn or s3_log_bucket)"
+        
+        return result
+
+    def get_application_logs_summary(self, app_id: str) -> Dict[str, Any]:
+        """
+        Get summary of all available logs for an application.
+
+        Args:
+            app_id: The application ID
+
+        Returns:
+            Dictionary with executor IDs and their available log types
+        """
+        executors = self.list_all_executors(app_id=app_id)
+
+        logs_summary = {
+            "application_id": app_id,
+            "total_executors": len(executors),
+            "executors_with_logs": 0,
+            "log_types_available": set(),
+            "executor_logs": {}
+        }
+
+        for executor in executors:
+            if executor.executor_logs:
+                logs_summary["executors_with_logs"] += 1
+                logs_summary["log_types_available"].update(executor.executor_logs.keys())
+                logs_summary["executor_logs"][executor.id] = {
+                    "log_types": list(executor.executor_logs.keys()),
+                    "log_urls": executor.executor_logs,
+                    "host_port": executor.host_port,
+                    "is_active": executor.is_active
+                }
+
+        logs_summary["log_types_available"] = sorted(list(logs_summary["log_types_available"]))
+
+        return logs_summary
+
+    def search_executor_logs(
+        self,
+        app_id: str,
+        search_pattern: str,
+        log_type: str = "stderr",
+        max_executors: int = 5,
+        max_lines_per_executor: int = 1000
+    ) -> List[Dict[str, Any]]:
+        """
+        Search for patterns across executor logs.
+
+        Args:
+            app_id: The application ID
+            search_pattern: Text pattern to search for (case-insensitive)
+            log_type: Type of log to search ('stderr', 'stdout', 'log4j')
+            max_executors: Maximum number of executors to search
+            max_lines_per_executor: Maximum lines to search per executor
+
+        Returns:
+            List of matches with executor context
+        """
+        logs_summary = self.get_application_logs_summary(app_id)
+        
+        if logs_summary["executors_with_logs"] == 0:
+            return []
+
+        matches = []
+        search_pattern_lower = search_pattern.lower()
+        
+        # Get executors that have the requested log type
+        executor_ids = [
+            exec_id for exec_id, exec_info in logs_summary["executor_logs"].items()
+            if log_type in exec_info["log_types"]
+        ][:max_executors]
+
+        for executor_id in executor_ids:
+            try:
+                # Estimate bytes needed for max_lines_per_executor
+                estimated_bytes = max_lines_per_executor * 150  # ~150 chars per line
+                
+                log_content = self.get_executor_log_content(
+                    app_id=app_id,
+                    executor_id=executor_id,
+                    log_type=log_type,
+                    length=estimated_bytes
+                )
+
+                lines = log_content.splitlines()
+                for line_num, line in enumerate(lines, 1):
+                    if search_pattern_lower in line.lower():
+                        matches.append({
+                            "executor_id": executor_id,
+                            "line_number": line_num,
+                            "line_content": line.strip(),
+                            "log_type": log_type
+                        })
+
+                        # Limit total matches to prevent overwhelming results
+                        if len(matches) >= 50:
+                            break
+
+            except Exception as e:
+                # Continue with other executors if one fails
+                matches.append({
+                    "executor_id": executor_id,
+                    "error": f"Failed to search logs: {str(e)}",
+                    "log_type": log_type
+                })
+                continue
+
+            # Break if we have enough matches
+            if len(matches) >= 50:
+                break
+
+        return matches
