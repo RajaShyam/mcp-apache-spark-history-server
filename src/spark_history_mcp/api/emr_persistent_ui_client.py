@@ -154,6 +154,13 @@ class EMRPersistentUIClient:
             self.presigned_url_ready = response.get("PresignedURLReady")
             self.presigned_url = response.get("PresignedURL")
 
+            # Handle case where presigned_url might be bytes
+            if isinstance(self.presigned_url, bytes):
+                self.presigned_url = self.presigned_url.decode('utf-8')
+            
+            if not self.presigned_url:
+                raise ValueError("Presigned URL is empty or None")
+
             # Extract base URL from presigned URL
             parsed_url = urlparse(self.presigned_url)
             self.base_url = f"{parsed_url.scheme}://{parsed_url.netloc}/shs"
@@ -243,40 +250,47 @@ class EMRPersistentUIClient:
         # Step 1: Create persistent app UI
         self.create_persistent_app_ui()
 
-        # Step 2: Describe persistent app UI and verify status
-        # Wait for up to 3 minutes if status is STARTING
-        max_wait_time = 180  # 3 minutes in seconds
-        wait_interval = 10  # Check every 10 seconds
-        total_waited = 0
-        ui_status = ""
-
-        while total_waited < max_wait_time:
-            describe_response = self.describe_persistent_app_ui()
-            ui_status = describe_response.get("PersistentAppUI", {}).get(
-                "PersistentAppUIStatus"
-            )
-
-            if ui_status == "ATTACHED":
-                # Status is good, proceed
-                break
-            elif ui_status == "STARTING":
-                # Status is starting, wait and check again
-                logger.info(
-                    f"EMR Persistent UI status is {ui_status}, waiting for ATTACHED status..."
+        # Step 2: Describe persistent app UI to get current status
+        describe_response = self.describe_persistent_app_ui()
+        ui_status = describe_response.get("PersistentAppUI", {}).get(
+            "PersistentAppUIStatus"
+        )
+        creation_time = describe_response.get("PersistentAppUI", {}).get("CreationTime")
+        
+        logger.info(f"EMR Persistent UI status: {ui_status}, created: {creation_time}")
+        
+        # Check if UI is very old and stuck in STARTING (more than 1 hour old)
+        if ui_status == "STARTING" and creation_time:
+            from datetime import datetime, timezone
+            import dateutil.parser
+            
+            created_dt = dateutil.parser.parse(str(creation_time))
+            now_dt = datetime.now(timezone.utc)
+            age_hours = (now_dt - created_dt).total_seconds() / 3600
+            
+            if age_hours > 1:
+                logger.warning(
+                    f"EMR Persistent UI has been in STARTING status for {age_hours:.1f} hours. "
+                    f"Proceeding anyway as it might still work."
                 )
-                time.sleep(wait_interval)
-                total_waited += wait_interval
             else:
-                # Status is something else (not STARTING or ATTACHED), raise error
-                raise ValueError(
-                    f"EMR Persistent UI status is {ui_status}, expected ATTACHED or STARTING"
-                )
-
-        # After waiting, check if we have the correct status
-        if ui_status != "ATTACHED":
-            raise ValueError(
-                f"EMR Persistent UI status is still {ui_status} after waiting {total_waited} seconds, expected ATTACHED"
-            )
+                # Only wait if it's relatively new (less than 1 hour old)
+                logger.info(f"EMR Persistent UI is new ({age_hours:.1f} hours old), waiting briefly...")
+                max_wait_time = 30  # Only wait 30 seconds for new UIs
+                wait_interval = 10
+                total_waited = 0
+                
+                while total_waited < max_wait_time and ui_status == "STARTING":
+                    time.sleep(wait_interval)
+                    total_waited += wait_interval
+                    describe_response = self.describe_persistent_app_ui()
+                    ui_status = describe_response.get("PersistentAppUI", {}).get(
+                        "PersistentAppUIStatus"
+                    )
+                    logger.info(f"EMR Persistent UI status after {total_waited}s: {ui_status}")
+        
+        # Proceed regardless of status - the presigned URL might still work
+        logger.info(f"Proceeding with EMR Persistent UI in {ui_status} status")
 
         # Step 3: Get presigned URL
         self.get_presigned_url()

@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -11,6 +12,8 @@ from mcp.server.fastmcp import FastMCP
 from spark_history_mcp.api.emr_persistent_ui_client import EMRPersistentUIClient
 from spark_history_mcp.api.spark_client import SparkRestClient
 from spark_history_mcp.config.config import Config
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -30,7 +33,9 @@ class DateTimeEncoder(json.JSONEncoder):
 
 @asynccontextmanager
 async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
-    config = Config.from_file("config.yaml")
+    # Get config path from environment variable, same as main.py
+    config_path = os.getenv("SHS_CONFIG_PATH", "config.yaml")
+    config = Config.from_file(config_path)
 
     clients: dict[str, SparkRestClient] = {}
     default_client = None
@@ -38,21 +43,27 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     for name, server_config in config.servers.items():
         # Check if this is an EMR server configuration
         if server_config.emr_cluster_arn:
-            # Create EMR client
-            emr_client = EMRPersistentUIClient(server_config)
+            try:
+                # Create EMR client
+                emr_client = EMRPersistentUIClient(server_config)
 
-            # Initialize EMR client (create persistent UI, get presigned URL, setup session)
-            base_url, session = emr_client.initialize()
+                # Initialize EMR client (create persistent UI, get presigned URL, setup session)
+                base_url, session = emr_client.initialize()
 
-            # Create a modified server config with the base URL
-            emr_server_config = server_config.model_copy()
-            emr_server_config.url = base_url
+                # Create a modified server config with the base URL
+                emr_server_config = server_config.model_copy()
+                emr_server_config.url = base_url
 
-            # Create SparkRestClient with the session
-            spark_client = SparkRestClient(emr_server_config)
-            spark_client.session = session  # Use the authenticated session
+                # Create SparkRestClient with the session
+                spark_client = SparkRestClient(emr_server_config)
+                spark_client.session = session  # Use the authenticated session
 
-            clients[name] = spark_client
+                clients[name] = spark_client
+            except Exception as e:
+                logger.error(f"Failed to initialize EMR client for {name}: {str(e)}")
+                logger.error(f"Falling back to regular Spark REST client")
+                # Fall back to regular client
+                clients[name] = SparkRestClient(server_config)
         else:
             # Regular Spark REST client
             clients[name] = SparkRestClient(server_config)
